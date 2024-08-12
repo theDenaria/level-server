@@ -1,0 +1,1 @@
+SELECT * FROM level_objects;

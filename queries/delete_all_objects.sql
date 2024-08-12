@@ -1,0 +1,1 @@
+DELETE FROM level_objects;
