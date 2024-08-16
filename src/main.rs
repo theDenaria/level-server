@@ -7,12 +7,16 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::{Deserialize, Serialize};
-use sqlx::{
-    postgres::PgPoolOptions, prelude::FromRow, query_file, query_file_as, query_file_scalar, PgPool,
+use queries::{
+    create_table_sql, delete_all_sql, get_first_id_sql, get_object_by_id_sql, get_objects_sql,
+    get_row_count_sql, set_object_sql,
 };
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, prelude::FromRow, query, query_as, query_scalar, PgPool};
 use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+mod queries;
 
 #[tokio::main]
 async fn main() {
@@ -34,9 +38,11 @@ async fn main() {
         .expect("can't connect to database");
 
     let app = Router::new()
-        .route("/get-objects", get(get_objects)) // will be called Denaria server to fetch Level's physics objects.
-        .route("/get-object", get(get_object)) // will be called Denaria server to fetch Level's physics objects.
-        .route("/set-objects", post(set_objects)) // will be called from Unity Level development scene manually
+        .route("/prepare", get(prepare_table))
+        .route("/get-objects", get(get_objects))
+        .route("/get-object", get(get_object))
+        .route("/get-first", get(get_first_id))
+        .route("/set-object", post(set_object)) // will be called from Unity Level development scene manually
         .with_state(pool);
 
     let listener = TcpListener::bind("127.0.0.1:3000").await.unwrap();
@@ -47,6 +53,7 @@ async fn main() {
 
 #[derive(Debug, Deserialize)]
 struct GetObjectParams {
+    version: String,
     id: i32,
 }
 
@@ -54,12 +61,11 @@ async fn get_object(
     State(pool): State<PgPool>,
     Query(params): Query<GetObjectParams>,
 ) -> Result<Json<LevelObject>, (StatusCode, String)> {
-    let result = query_file_as!(LevelObject, "queries/get_object_by_id.sql", params.id)
+    let query_string = get_object_by_id_sql(params.version);
+    let result = query_as::<_, LevelObject>(query_string.as_str())
+        .bind(params.id)
         .fetch_one(&pool)
         .await;
-    //.map_err(internal_error);
-
-    tracing::info!("Request came with id: {}", params.id);
 
     match result {
         Ok(object) => Ok(Json(object)),
@@ -67,25 +73,61 @@ async fn get_object(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GetFirstIdParams {
+    version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GetFirstIdResponse {
+    id: i32,
+}
+
+async fn get_first_id(
+    State(pool): State<PgPool>,
+    Query(params): Query<GetFirstIdParams>,
+) -> Result<Json<GetFirstIdResponse>, (StatusCode, String)> {
+    let query_string = get_first_id_sql(params.version);
+    let result: Result<Option<i32>, (StatusCode, String)> = query_scalar(query_string.as_str())
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error);
+    match result {
+        Ok(id_result) => match id_result {
+            Some(id) => {
+                return Ok(Json(GetFirstIdResponse { id }));
+            }
+            None => Err(internal_error_from_string("No id found".to_string())),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GetAllObjectsParams {
+    version: String,
+}
 async fn get_objects(
     State(pool): State<PgPool>,
-) -> Result<Json<GetObjectsResonse>, (StatusCode, String)> {
-    let result = query_file_as!(LevelObject, "queries/get_objects.sql")
+    Query(params): Query<GetAllObjectsParams>,
+) -> Result<Json<GetObjectsResponse>, (StatusCode, String)> {
+    let query_string = get_objects_sql(params.version);
+    let result = query_as::<_, LevelObject>(query_string.as_str())
         .fetch_all(&pool)
         .await;
-    //.map_err(internal_error);
 
     match result {
-        Ok(objects) => Ok(Json(GetObjectsResonse { objects })),
+        Ok(objects) => Ok(Json(GetObjectsResponse { objects })),
         Err(e) => Err(internal_error(e)),
     }
 }
 
-async fn set_objects(
+async fn set_object(
     State(pool): State<PgPool>,
     Json(req): Json<SetLevelObjectRequest>,
 ) -> Result<Json<SetObjectsResonse>, (StatusCode, String)> {
     let SetLevelObjectRequest {
+        version,
         object_type,
         position,
         rotation,
@@ -93,31 +135,23 @@ async fn set_objects(
         collider,
     } = req;
 
-    let set_result = query_file!(
-        "queries/set_object.sql",
-        object_type,
-        position,
-        rotation,
-        scale,
-        collider,
-    )
-    .execute(&pool)
-    .await;
-    tracing::trace!(
-        "type: {}, color: {}, position: {:?}, scale: {:?}, set_result: {:?}",
-        object_type,
-        position,
-        scale,
-        rotation,
-        set_result
-    );
+    let query_string = set_object_sql(version.clone());
 
-    let count_result = query_file_scalar!("queries/get_row_count.sql")
+    let _set_result = query(query_string.as_str())
+        .bind(&object_type)
+        .bind(&position)
+        .bind(&rotation)
+        .bind(&scale)
+        .bind(&collider)
+        .execute(&pool)
+        .await;
+
+    let query_string = get_row_count_sql(version);
+
+    let count_result = query_scalar(query_string.as_str())
         .fetch_one(&pool)
         .await
         .map_err(internal_error);
-
-    tracing::trace!("count_result: {:?}", count_result);
 
     match count_result {
         Ok(count_op) => match count_op {
@@ -125,6 +159,47 @@ async fn set_objects(
                 return Ok(Json(SetObjectsResonse {
                     count,
                     success: true,
+                }));
+            }
+            None => return Err((StatusCode::INTERNAL_SERVER_ERROR, "No count".to_string())),
+        },
+        Err((_, em)) => Err(internal_error_from_string(em)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PrepareTableParams {
+    version: String,
+}
+async fn prepare_table(
+    State(pool): State<PgPool>,
+    Query(params): Query<PrepareTableParams>,
+) -> Result<Json<SetObjectsResonse>, (StatusCode, String)> {
+    let query_string = create_table_sql(params.version.clone());
+    let set_result = query(query_string.as_str()).execute(&pool).await;
+
+    let query_string = delete_all_sql(params.version.clone());
+    let set_result = query(query_string.as_str()).execute(&pool).await;
+
+    let query_string = get_row_count_sql(params.version);
+
+    let count_result = query_scalar(query_string.as_str())
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error);
+
+    match count_result {
+        Ok(count_op) => match count_op {
+            Some(count) => {
+                if count == 0 {
+                    return Ok(Json(SetObjectsResonse {
+                        count,
+                        success: true,
+                    }));
+                }
+                return Ok(Json(SetObjectsResonse {
+                    count,
+                    success: false,
                 }));
             }
             None => return Err((StatusCode::INTERNAL_SERVER_ERROR, "No count".to_string())),
@@ -157,7 +232,7 @@ pub struct LevelObject {
 }
 
 #[derive(Serialize, Deserialize)]
-struct GetObjectsResonse {
+struct GetObjectsResponse {
     objects: Vec<LevelObject>,
 }
 
@@ -168,38 +243,15 @@ struct GetObjectByIdResonse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetLevelObjectRequest {
+    version: String,
     object_type: String,
     position: String,
     rotation: String,
     scale: String,
     collider: String,
 }
-
-// #[derive(Serialize, Deserialize)]
-// struct SetObjectsRequest {
-//     objects: Vec<SetLevelObject>,
-// }
-
 #[derive(Serialize, Deserialize)]
 struct SetObjectsResonse {
     count: i64,
     success: bool,
 }
-
-// async fn create_user(
-//     State(pool): State<deadpool_diesel::postgres::Pool>,
-//     Json(new_user): Json<NewUser>,
-// ) -> Result<Json<User>, (StatusCode, String)> {
-//     let conn = pool.get().await.map_err(internal_error)?;
-//     let res = conn
-//         .interact(|conn| {
-//             diesel::insert_into(users::table)
-//                 .values(new_user)
-//                 .returning(User::as_returning())
-//                 .get_result(conn)
-//         })
-//         .await
-//         .map_err(internal_error)?
-//         .map_err(internal_error)?;
-//     Ok(Json(res))
-// }
